@@ -1,0 +1,129 @@
+EKS Cluster & AWS Load Balancer Controller Setup Guide
+1. Prerequisites & Infrastructure
+
+1.1. Cluster IAM Role: AmazonEKSAutoClusterRole
+
+Service: EKS
+
+Attached Policies:
+
+AmazonEKSBlockStoragePolicy, AmazonEKSClusterPolicy, AmazonEKSComputePolicy, AmazonEKSLoadBalancingPolicy, AmazonEKSNetworkingPolicy
+
+Trust Relationship:
+
+JSON
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": { "Service": "eks.amazonaws.com" },
+            "Action": ["sts:AssumeRole", "sts:TagSession"]
+        }
+    ]
+}
+1.2. Node IAM Role: AmazonEKSNodeRole
+
+Service: EC2
+
+Attached Policies:
+
+AmazonEC2ContainerRegistryPullOnly, AmazonEKS_CNI_Policy, AmazonEKSWorkerNodePolicy
+
+Trust Relationship: Standard ec2.amazonaws.com assume role.
+
+1.3. Networking (VPC & Subnets)
+
+VPC: CIDR 10.10.0.0/16 (Enable DNS Hostnames & Support).
+
+Public Subnets (A, B, C): * Mandatory Tags: * kubernetes.io/role/elb = 1
+* kubernetes.io/cluster/<cluster-name> = shared
+
+Settings: Enable "Auto-assign public IPv4 address".
+
+Connectivity: Create Internet Gateway (IGW) and update Route Table (0.0.0.0/0 -> IGW).
+
+2. Cluster Deployment & IAM Integration
+
+2.1. Deployment Steps
+
+Create EKS Cluster (Auto Mode or Standard).
+
+Crucial: Associate IAM OIDC Provider.
+
+Install Add-ons: VPC CNI, CoreDNS, kube-proxy.
+
+Create Node Group using the Role from step 1.2.
+
+2.2. Controller IAM Role: AmazonEKSLoadBalancerControllerRole
+
+This role allows the Kubernetes pod to talk to AWS.
+
+Policies: AWSLoadBalancerControllerIAMPolicy, AmazonEC2FullAccess.
+
+Trust Relationship: > Note: Every time you create a new cluster, you MUST update the OIDC ID in this Trust Relationship to match the new cluster's OIDC provider URL.
+
+JSON
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/<OIDC_URL>"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "<OIDC_URL>:aud": "sts.amazonaws.com",
+                    "<OIDC_URL>:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller"
+                }
+            }
+        }
+    ]
+}
+3. Ubuntu Configuration & Connection
+
+Update Config: aws eks update-kubeconfig --region us-east-1 --name <cluster-name>
+
+Access Entry: If you get Forbidden, go to EKS Console -> Access -> Create Access Entry. Add your IAM User and associate AmazonEKSClusterAdminPolicy.
+
+4. Kubernetes Configuration (The "Golden Manifest" Run)
+
+4.1. Cert-Manager Installation
+
+Install the certificate manager first. If you encounter OpenAPI validation errors, use the --validate=false flag.
+
+Bash
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.3/cert-manager.yaml --validate=false
+
+# Wait for all pods to be 1/1 Running
+kubectl get pods -n cert-manager
+4.2. Ingress Controller Deployment
+
+Open your ingress-controller-v4.yaml (Golden Manifest) in Sublime.
+
+Update: Ensure --cluster-name and --aws-vpc-id match your new environment.
+
+Apply Manifest:
+
+Bash
+kubectl apply -f ingress-controller-v4.yaml
+4.3. Verification
+
+Bash
+# Verify Controller is Running (Check for 1/1 status)
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+
+# Deploy Test App & Ingress
+kubectl apply -f test-ingress.yaml
+
+# Check if Load Balancer DNS is generated
+kubectl get ingress
+Troubleshooting Tips for Tomorrow:
+
+Pod in Pending? Run kubectl describe pod <name> -n kube-system. Check for "Insufficient CPU" or "untolerated taints".
+
+ALB not appearing in AWS? Check controller logs: kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller. Look for AccessDenied (IAM/OIDC issue) or subnets not found (Tagging issue).
+
+Certificates Pending? Restart the injector: kubectl rollout restart deployment cert-manager-cainjector -n cert-manager.
